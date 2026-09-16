@@ -1,0 +1,7 @@
+{
+  "Subject": "CN=CMP170HX Local Development Test",
+  "Thumbprint": "A7F7AFFE8B030625404BC0274505426B4CE7E874",
+  "NotBefore": "2026-09-15T07:00:56+08:00",
+  "NotAfter": "2028-09-15T07:10:56+08:00",
+  "HasPrivateKey": true
+}
