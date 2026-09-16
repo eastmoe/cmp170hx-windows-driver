@@ -1,0 +1,44 @@
+[Version]
+Signature="$WINDOWS NT$"
+Class=Display
+ClassGuid={4d36e968-e325-11ce-bfc1-08002be10318}
+Provider=%Provider%
+CatalogFile=cmp170.cat
+DriverVer=09/16/2026,0.9.0.0
+PnpLockdown=1
+
+[Manufacturer]
+%Provider%=Models,NTamd64.10.0...19041
+[Models.NTamd64.10.0...19041]
+%Device%=Install,PCI\VEN_10DE&DEV_20C2
+%Device%=Install,PCI\VEN_10DE&DEV_2082
+[Install.NT]
+CopyFiles=DriverCopy
+[Install.NT.HW]
+AddReg=Security
+[Security]
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)"
+[Install.NT.Services]
+AddService=cmp170,0x00000002,Service
+[Service]
+DisplayName=%Device%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%13%\cmp170.sys
+[Install.NT.Wdf]
+KmdfService=cmp170,Wdf
+[Wdf]
+KmdfLibraryVersion=1.31
+[DestinationDirs]
+DriverCopy=13
+[DriverCopy]
+cmp170.sys
+[SourceDisksNames]
+1=%Disk%,,,
+[SourceDisksFiles]
+cmp170.sys=1
+[Strings]
+Provider="Local CMP Research"
+Device="CMP 170HX Experimental Windows Unlocker"
+Disk="Local CMP 170HX Test Driver"
