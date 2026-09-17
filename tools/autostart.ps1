@@ -5,6 +5,7 @@ $runtime=Join-Path $env:ProgramFiles 'CMP170HX'
 $data=Join-Path $env:ProgramData 'CMP170HX'
 $source=Split-Path $PSScriptRoot
 . "$PSScriptRoot\diagnostics.ps1"
+. "$PSScriptRoot\common.ps1"
 function Invoke-Cmp([string]$File,[string[]]$Arguments) {
     Write-Host "$(Get-Date -Format o) EXEC $File $($Arguments -join ' ')"
     & $File @Arguments
@@ -13,10 +14,10 @@ function Invoke-Cmp([string]$File,[string[]]$Arguments) {
     if($code -eq 3010){throw 'Reboot required by PnP; automatic operation stopped. See diagnostics and Restore.'}
     if($code){throw "$File failed with exit code $code"}
 }
-function Target {
+function Targets {
     $found=@(Get-PnpDevice -PresentOnly | Where-Object InstanceId -Match '^PCI\\VEN_10DE&DEV_(20C2|2082)&')
-    if($found.Count -ne 1){throw "Expected exactly one CMP GPU; found $($found.Count)"}
-    return $found[0]
+    if($found.Count -lt 1){throw 'No present CMP GPU.'}
+    return $found
 }
 function Service($Device) { (Get-PnpDeviceProperty -InstanceId $Device.InstanceId -KeyName DEVPKEY_Device_Service).Data }
 if(!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'Administrator PowerShell required.'}
@@ -38,8 +39,10 @@ if($Action -eq 'Install') {
         $sig=Get-AuthenticodeSignature "$source\dist\$name"
         if($sig.Status -ne 'Valid'){throw "Signature not trusted/valid for $name ($($sig.Status)); sign and run PrepareTestSigning first."}
     }
-    $device=Target
-    $service=Service $device
+    $devices=@(Targets)
+    $serviceValues=@($devices | ForEach-Object {Service $_} | Sort-Object -Unique)
+    if($serviceValues.Count -ne 1){throw "Mixed driver services across CMP targets: $($serviceValues -join ', ')"}
+    $service=$serviceValues[0]
     foreach($directory in $runtime,$data) {
         New-Item -ItemType Directory -Force $directory | Out-Null
         # SYSTEM executes these files. Do not inherit writable user permissions.
@@ -47,26 +50,31 @@ if($Action -eq 'Install') {
     }
     New-Item -ItemType Directory -Force "$runtime\dist","$runtime\tools","$runtime\backup" | Out-Null
     if($service -eq 'nvlddmkm') {
-        $inf=(Get-PnpDeviceProperty -InstanceId $device.InstanceId -KeyName DEVPKEY_Device_DriverInfPath).Data
-        if($inf -notmatch '^oem\d+\.inf$'){throw 'Unexpected NVIDIA published INF'}
+        $published=@($devices | ForEach-Object {(Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName DEVPKEY_Device_DriverInfPath).Data} | Sort-Object -Unique)
+        if($published.Count -ne 1 -or $published[0] -notmatch '^oem\d+\.inf$'){throw "Expected one published NVIDIA INF across all CMP targets; found: $($published -join ', ')"}
         $backup="$runtime\backup\$(Get-Date -Format yyyyMMdd-HHmmss-fff)"
         New-Item -ItemType Directory -Force $backup | Out-Null
-        Invoke-Cmp pnputil.exe @('/export-driver',$inf,$backup)
+        Invoke-Cmp pnputil.exe @('/export-driver',$published[0],$backup)
         $original=@(Get-ChildItem $backup -Recurse -Filter '*.inf')
         if($original.Count -ne 1){throw 'Expected one exported NVIDIA INF'}
-        $saved=@{InstanceId=$device.InstanceId;PublishedInf=$inf;OriginalInf=$original[0].FullName}
+        $saved=@{InstanceIds=@($devices | ForEach-Object {$_.InstanceId});PublishedInf=$published[0];OriginalInf=$original[0].FullName}
     } elseif($service -eq 'cmp170') {
         $recovery="$source\backup\restore.json"
         if(!(Test-Path $recovery)){$recovery="$runtime\backup\restore.json"}
         $saved=Get-Content $recovery -Raw | ConvertFrom-Json
-        if($saved.InstanceId -ne $device.InstanceId -or !(Test-Path $saved.OriginalInf)){throw 'Missing or mismatched NVIDIA recovery backup'}
+        $savedInstances=@(Get-CmpRecoveryInstances $saved)
+        $current=@($devices | ForEach-Object {$_.InstanceId})
+        if(!$savedInstances.Count -or !(Test-Path $saved.OriginalInf)){throw 'Missing or mismatched NVIDIA recovery backup'}
+        # One exported NVIDIA package covers the whole model family, so the saved record must cover every target.
+        foreach($id in $savedInstances){if($current -notcontains $id){throw "Saved recovery device no longer present: $id"}}
+        $saved.InstanceIds=$current
         $backup="$runtime\backup\import-$(Get-Date -Format yyyyMMdd-HHmmss-fff)"
         Copy-Item -LiteralPath (Split-Path $saved.OriginalInf) -Destination $backup -Recurse
         $saved.OriginalInf=Join-Path $backup (Split-Path $saved.OriginalInf -Leaf)
     } else {throw "Unexpected service: $service"}
     $saved | ConvertTo-Json | Set-Content "$runtime\backup\restore.json"
     Copy-Item "$source\dist\*" "$runtime\dist" -Force
-    Copy-Item "$source\tools\autostart.ps1","$source\tools\diagnostics.ps1" "$runtime\tools" -Force
+    Copy-Item "$source\tools\autostart.ps1","$source\tools\diagnostics.ps1","$source\tools\common.ps1" "$runtime\tools" -Force
     # Stage signed package now; the startup task performs the actual rebind.
     Invoke-Cmp pnputil.exe @('/add-driver',"$runtime\dist\cmp170.inf")
     $exe="$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
@@ -91,26 +99,35 @@ try {
     if(Test-Path "$data\last-boot.txt") {
         if((Get-Content "$data\last-boot.txt" -Raw).Trim() -eq $boot){Write-Host 'Already attempted this Windows boot.';return}
     }
-    $device=Target
+    $devices=@(Targets)
     $saved=Get-Content "$runtime\backup\restore.json" -Raw | ConvertFrom-Json
-    if($device.InstanceId -ne $saved.InstanceId -or !(Test-Path $saved.OriginalInf)){throw 'GPU/recovery mismatch'}
-    if((Service $device) -notin 'nvlddmkm','cmp170'){throw 'Unexpected target service'}
+    $savedInstances=@(Get-CmpRecoveryInstances $saved)
+    $current=@($devices | ForEach-Object {$_.InstanceId})
+    if(!$savedInstances.Count -or !(Test-Path $saved.OriginalInf)){throw 'GPU/recovery mismatch'}
+    foreach($id in $savedInstances){if($current -notcontains $id){throw "GPU/recovery mismatch: $id not present"}}
+    foreach($device in $devices) {
+        if((Service $device) -notin 'nvlddmkm','cmp170'){throw "Unexpected target service on $($device.InstanceId)"}
+    }
     # Persist BEFORE rebind: a crash or forced termination leaves the next run paused.
     @{Boot=$boot;Log=$session;State='in-progress';Time=(Get-Date -Format o)} | ConvertTo-Json | Set-Content "$data\blocked.json"
     Set-Content "$data\last-boot.txt" $boot
     $ctl="$runtime\dist\cmpctl.exe"
     Invoke-Cmp $ctl @('--bind',"$runtime\dist\cmp170.inf",'--ack-device-rebind')
     Save-CmpDiagnostics "$session\bound"
-    $device=Target
-    if((Service $device) -ne 'cmp170' -or $device.Status -ne 'OK'){throw 'Experimental driver did not start; see bound/device.txt and kernel/CodeIntegrity logs.'}
+    $devices=@(Targets)
+    foreach($device in $devices) {
+        if((Service $device) -ne 'cmp170' -or $device.Status -ne 'OK'){throw "Experimental driver did not start on $($device.InstanceId); see bound/device.txt and kernel/CodeIntegrity logs."}
+    }
     Invoke-Cmp $ctl @('--diag')
     Invoke-Cmp $ctl @('--memory','--ack-experimental')
     Invoke-Cmp $ctl @('--diag')
     Invoke-Cmp $ctl @('--memory-handover','--ack-experimental')
     Save-CmpDiagnostics "$session\unlocked"
     Invoke-Cmp $ctl @('--bind',$saved.OriginalInf,'--ack-device-rebind')
-    $device=Target
-    if((Service $device) -ne 'nvlddmkm' -or $device.Status -ne 'OK'){throw 'NVIDIA restore did not reach OK state'}
+    $devices=@(Targets)
+    foreach($device in $devices) {
+        if((Service $device) -ne 'nvlddmkm' -or $device.Status -ne 'OK'){throw "NVIDIA restore did not reach OK state on $($device.InstanceId)"}
+    }
     Remove-Item -LiteralPath "$data\blocked.json"
     Write-Host 'Register operation succeeded and NVIDIA restored. Capacity/residency still needs validation; see nvidia log.'
 } catch {

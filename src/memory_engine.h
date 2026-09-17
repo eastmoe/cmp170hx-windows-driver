@@ -114,11 +114,110 @@ static BOOLEAN memoryState(Context *c) {
         poll(c,0x41a610,1,1)&&poll(c,0x41a614,0xa22,0xa20)&&
         poll(c,0x502610,1,1)&&poll(c,0x502614,0xa22,0xa20);
 }
+/* Readback is a configuration result, not proof of negotiated Gen2. */
+static BOOLEAN pcieVerify(Context *c) {
+    ULONG i,v;BOOLEAN ok=TRUE;
+    for(i=0;i<PCIE_COUNT;i++) {
+        v=readReg(c,pcie_regs[i]);c->report.pcie_after[i]=v;
+        if(v==~0u&&i>=7)ok=FALSE;
+        if((v^c->report.pcie_wanted[i])&pcie_mask(i)) {
+            ok=FALSE;trace("pcie.mismatch.register",c->report.stage,STATUS_DEVICE_HARDWARE_ERROR,pcie_regs[i]);
+            trace("pcie.mismatch.value",c->report.stage,STATUS_DEVICE_HARDWARE_ERROR,v);
+        }
+        if(i==12&&v!=c->report.pcie_wanted[i])trace("pcie.VSEC_DEVICE.optional-bit0",c->report.stage,STATUS_SUCCESS,v);
+    }
+    c->report.pcie_link_status=readReg(c,0x88088);
+    if(c->report.pcie_link_status==~0u||c->report.pcie_after[17]==~0u)ok=FALSE;
+    trace("pcie.link-status",c->report.stage,STATUS_SUCCESS,c->report.pcie_link_status);
+    return ok&&!c->ioFailed;
+}
+static BOOLEAN pciePrepare(Context *c) {
+    ULONG i,v;
+    for(i=0;i<PCIE_COUNT;i++) {
+        v=readReg(c,pcie_regs[i]);c->report.pcie_before[i]=v;
+        if(c->ioFailed||(i>=7&&v==~0u))return FALSE;
+        c->report.pcie_wanted[i]=pcie_value(i,v);
+    }
+    return TRUE;
+}
+static BOOLEAN pcieHost(Context *c) {
+    ULONG i;
+    for(i=13;i<17;i++) {
+        memoryWrite(c,pcie_regs[i],c->report.pcie_wanted[i]);
+        trace("pcie.host.register",c->report.stage,STATUS_SUCCESS,pcie_regs[i]);
+        trace("pcie.host.readback",c->report.stage,STATUS_SUCCESS,readReg(c,pcie_regs[i]));
+    }
+    /* GA100 patch 0008's XVE override is required on some cards before TLS
+     * accepts Gen2. One bounded fallback only, no upstream bridge access. */
+    if(!c->ioFailed&&(readReg(c,0x880a8)&15)==1) {
+        ULONG xve=readReg(c,0x8872c);
+        trace("pcie.XVE.before",c->report.stage,STATUS_SUCCESS,xve);
+        if(c->ioFailed||xve==~0u)return FALSE;
+        for(i=0;i<16;i++)if(((readReg(c,pcie_regs[i])^c->report.pcie_wanted[i])&pcie_mask(i))||c->ioFailed)return FALSE;
+        memoryWrite(c,0x8872c,6);
+        for(i=0;i<50;i++)pauseMs();
+        trace("pcie.XVE.after",c->report.stage,STATUS_SUCCESS,readReg(c,0x8872c));
+        if(c->ioFailed||readReg(c,0)==~0u)return FALSE;
+        memoryWrite(c,0x880a8,c->report.pcie_wanted[16]);
+    }
+    c->report.pcie_configured=pcieVerify(c)?1u:0u;
+    return c->report.pcie_configured!=0;
+}
+static BOOLEAN pcieIdle(Context *c) {
+    c->report.stop_final[0]=readReg(c,0x84010c);c->report.stop_final[1]=readReg(c,0x11010c);
+    c->report.stop_cpu[0]=readReg(c,0x840100);c->report.stop_cpu[1]=readReg(c,0x110100);
+    c->report.stop_dma[0]=readReg(c,0x840118);c->report.stop_dma[1]=readReg(c,0x110118);
+    c->report.stop_gsp_riscv=readReg(c,0x111240);
+    return !c->ioFailed&&c->report.stop_final[0]!=~0u&&c->report.stop_final[1]!=~0u&&
+        !(c->report.stop_final[0]&6)&&!(c->report.stop_final[1]&6)&&
+        c->report.stop_cpu[0]==16&&c->report.stop_cpu[1]==16&&
+        c->report.stop_dma[0]==2&&c->report.stop_dma[1]==2&&
+        c->report.stop_gsp_riscv==0&&readReg(c,0x84004c)==0;
+}
+/* Resume only already-complete Memory + PCIe privileged state. No allocation,
+ * payload launch, engine reset or memory geometry write on this path. */
+static NTSTATUS runPcieResume(Context *c) {
+    ULONG i;BOOLEAN ok;
+    if(c->profile->device!=0x20c2||c->buffer||!memoryTargets(c)||!memoryState(c)||
+       !pcieIdle(c)||!pciePrepare(c))return STATUS_INVALID_DEVICE_STATE;
+    for(i=0;i<12;i++)if(c->report.pcie_before[i]!=c->report.pcie_wanted[i])return STATUS_INVALID_DEVICE_STATE;
+    c->attempted=TRUE;c->report.stage=23;
+    for(i=0;i<3;i++)c->report.cleanup_before[i]=readReg(c,cleanupRegs[i]);
+    ok=pcieHost(c);
+    c->quiescent=pcieIdle(c);
+    if(c->quiescent)c->report.checks|=CMP_SEC2_STOPPED|CMP_GSP_STOPPED;
+    for(i=0;i<3;i++)c->report.cleanup_after[i]=readReg(c,cleanupRegs[i]);
+    c->report.cleanup_mismatch=(c->report.cleanup_after[0]!=0x1ffffe00?1u:0u)|
+        (c->report.cleanup_after[1]!=0?2u:0u)|(c->report.cleanup_after[2]&0xfff00000?4u:0u);
+    ok=ok&&c->quiescent&&!c->report.cleanup_mismatch&&memoryTargets(c)&&memoryState(c);
+    /* No DMA was allocated; ownership is empty, independently observed idle. */
+    c->report.checks|=CMP_DMA_RELEASED;
+    if(ok)c->report.checks|=CMP_TARGET_MATCHED|CMP_CLEANUP_VERIFIED;
+    snapshot(c,c->report.after);ok=ok&&!c->ioFailed;
+    c->report.state=ok?1:2;if(ok)c->report.stage=30;
+    trace("pcie.resume.no-payload",c->report.stage,ok?STATUS_SUCCESS:STATUS_DEVICE_HARDWARE_ERROR,c->report.checks);
+    return ok?STATUS_SUCCESS:STATUS_DEVICE_HARDWARE_ERROR;
+}
+static BOOLEAN pcieApply(Context *c) {
+    ULONG i;
+    /* Stop/drain the first launch before touching its shared DMA signature. */
+    if(!memoryStop(c))return FALSE;
+    fill_pcie_signature((u8*)c->buffer+4096,(const u32*)c->report.pcie_wanted,c->profile->cfg1,c->profile->lmr);
+    if(!memorySec2(c))return FALSE;
+    c->report.stage=22;memoryWrite(c,0x14fc,0);
+    if(!poll(c,0x14fc,~0u,0)||!fire(c,0x14fc,0x4f4e0013)||
+       !poll(c,0x840118,3,2)||!poll(c,0x84004c,0xffff,0)||!memoryStop(c))return FALSE;
+    for(i=0;i<13;i++)if(((readReg(c,pcie_regs[i])^c->report.pcie_wanted[i])&pcie_mask(i))||c->ioFailed)return FALSE;
+    /* No PL_LINK_RATE constant, LTSSM kick, endpoint RL, or upstream writes.
+     * NVIDIA/PnP may train at handover; post-bind acceptance checks real speed. */
+    return pcieHost(c);
+}
 static NTSTATUS runMemory(WDFDEVICE dev,Context *c) {
     ULONG i,bit,npages=(MEMORY_FW_SIZE+4095)/4096,leaves=(npages+511)/512;
     ULONGLONG base,*root,*middle,*leaf;PUCHAR p;NTSTATUS status;
     BOOLEAN ok=FALSE,stopped,graphics=FALSE;
     if(!memoryResetBit(c,&bit))return STATUS_NOT_SUPPORTED;
+    if(c->report.pcie_requested&&!pciePrepare(c))return STATUS_DEVICE_HARDWARE_ERROR;
     c->bytes=(23+leaves)*4096;status=allocateDma(dev,c);
     if(!NT_SUCCESS(status))return status;
     p=c->buffer;base=(ULONGLONG)c->logical.QuadPart;
@@ -140,6 +239,7 @@ static NTSTATUS runMemory(WDFDEVICE dev,Context *c) {
     /* Marker precedes the exit tail. Drain before post-payload reset. */
     if(!poll(c,0x840118,3,2)||!poll(c,0x84004c,0xffff,0))goto done;
     ok=memoryTargets(c);
+    if(ok&&c->report.pcie_requested)ok=pcieApply(c);
     if(ok)c->report.checks|=CMP_TARGET_MATCHED;
 done:
     c->report.stage=21;
@@ -152,7 +252,7 @@ done:
     for(i=0;i<3;i++)c->report.cleanup_after[i]=readReg(c,cleanupRegs[i]);
     c->report.cleanup_mismatch=(c->report.cleanup_after[0]!=0x1ffffe00?1u:0u)|
         (c->report.cleanup_after[1]!=0?2u:0u)|(c->report.cleanup_after[2]&0xfff00000?4u:0u);
-    if(graphics&&c->quiescent&&!c->report.cleanup_mismatch&&memoryTargets(c)&&memoryState(c))c->report.checks|=CMP_CLEANUP_VERIFIED;
+    if(graphics&&c->quiescent&&!c->report.cleanup_mismatch&&memoryTargets(c)&&memoryState(c)&&(!c->report.pcie_requested||pcieVerify(c)))c->report.checks|=CMP_CLEANUP_VERIFIED;
     ok=ok&&(c->report.checks&CMP_CLEANUP_VERIFIED)!=0;
     snapshot(c,c->report.after);freeDma(c);
     ok=ok&&!c->ioFailed&&(c->report.checks&CMP_DMA_RELEASED)!=0;

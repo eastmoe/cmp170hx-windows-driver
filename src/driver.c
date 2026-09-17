@@ -13,6 +13,7 @@
 #include "core.h"
 #include "firmware.h"
 #include "memory_payload.h"
+#include "pcie.h"
 #ifndef CMP_HOST_TEST
 #define NTSTRSAFE_LIB
 #include <ntstrsafe.h>
@@ -55,6 +56,7 @@ typedef struct {
 static BOOLEAN memoryStop(Context *c);
 static BOOLEAN memoryTargets(Context *c);
 static BOOLEAN memoryState(Context *c);
+static BOOLEAN pcieVerify(Context *c);
 #ifdef CMP_HOST_TEST
 #include "../tests/host.h"
 #else
@@ -207,7 +209,7 @@ static VOID diagnose(Context *c) {
         valid=valid&&!(c->report.after[8]>>4)&&!(c->report.after[12]&(c->report.mode==CMP_MEMORY?0xfff00000u:~0u));
         valid=valid&&c->report.after[2]==~0u&&c->report.after[3]==0x88888888&&c->report.after[4]==8;
         if(c->report.mode==CMP_MEMORY)
-            valid=valid&&c->report.after[5]==c->profile->cfg1&&c->report.after[6]==c->profile->lmr&&memoryTargets(c)&&memoryState(c);
+            valid=valid&&c->report.after[5]==c->profile->cfg1&&c->report.after[6]==c->profile->lmr&&memoryTargets(c)&&memoryState(c)&&(!c->report.pcie_requested||pcieVerify(c));
     }
     c->report.diagnostic_status=valid?STATUS_SUCCESS:(ULONG)STATUS_DEVICE_HARDWARE_ERROR;
     if(!valid) {
@@ -288,6 +290,10 @@ static NTSTATUS run(WDFDEVICE dev,Context *c,ULONG mode) {
     snapshot(c,c->report.before);
     for(i=0;i<CMP_REG_COUNT;i++)if(i!=2&&(i<13||i==16)&&c->report.before[i]==~0u)c->ioFailed=TRUE;
     if(c->ioFailed)return STATUS_DEVICE_HARDWARE_ERROR;
+    if(mode==CMP_MEMORY&&c->report.pcie_requested==CMP_GEN2_RESUME) {
+        if(c->bus.GetBusData(c->bus.Context,PCI_WHICHSPACE_CONFIG,&command,4,2)!=2||(command&6)!=6)return STATUS_DEVICE_NOT_READY;
+        return runPcieResume(c);
+    }
     /* Memory bring-up is validated against the user's cold 8 GiB board.
      * Reject unknown/previously expanded geometry BEFORE allocating DMA or
      * launching SEC2. 10 GiB cold geometry has not been captured on Windows. */
@@ -496,8 +502,10 @@ VOID Control(WDFQUEUE q,WDFREQUEST request,size_t outSize,size_t inSize,ULONG co
     if(code==CMP_RUN||code==CMP_FINAL_RESET||code==CMP_MEMORY_HANDOVER) {
         s=WdfRequestRetrieveInputBuffer(request,sizeof(*in),(PVOID*)&in,NULL);if(!NT_SUCCESS(s))goto fail;
         input=*in;
-        if(input.version!=CMP_VERSION||input.ack!=CMP_ACK||input.reserved||
+        if(input.version!=CMP_VERSION||input.ack!=CMP_ACK||
+           (input.reserved && !(code==CMP_RUN&&input.mode==CMP_MEMORY&&(input.reserved==CMP_GEN2_REQUEST||input.reserved==CMP_GEN2_RESUME)))||
            (code==CMP_RUN?(input.mode!=CMP_COMPUTE&&input.mode!=CMP_MEMORY):input.mode!=0)){s=STATUS_INVALID_PARAMETER;goto fail;}
+        if(code==CMP_RUN&&!c->attempted&&!c->mmioClosed)c->report.pcie_requested=input.reserved;
         s=code==CMP_FINAL_RESET?finalReset(c):code==CMP_MEMORY_HANDOVER?memoryHandover(c):run(dev,c,input.mode);c->report.status=(ULONG)s;
         trace("Control.run-return",c->report.stage,s,c->report.state);
     } else {
@@ -526,7 +534,7 @@ NTSTATUS AddDevice(WDFDRIVER driver,PWDFDEVICE_INIT init) {
 NTSTATUS DriverEntry(PDRIVER_OBJECT driver,PUNICODE_STRING path) {
     NTSTATUS s;WDF_DRIVER_CONFIG config;WDF_DRIVER_CONFIG_INIT(&config,AddDevice);
     trace("DriverEntry",0,STATUS_SUCCESS,WdfMinimumVersionRequired);
-    trace("Build.0.9.0.0",0,STATUS_SUCCESS,CMP_BUILD);
+    trace("Build.0.11.0.0",0,STATUS_SUCCESS,CMP_BUILD);
     s=WdfDriverCreate(driver,path,WDF_NO_OBJECT_ATTRIBUTES,&config,WDF_NO_HANDLE);
     trace("WdfDriverCreate",0,s,config.Size);return s;
 }

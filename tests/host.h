@@ -18,7 +18,7 @@ static NTSTATUS fakeFinalReset(PVOID context,DEVICE_RESET_TYPE type,ULONG flags,
 static BOOLEAN allocationFail,fireFail,resetFail,cleanupIgnore,cleanupReadFail,dmaBusy,finalSnapshotFail;
 /* Model assumptions: WPR_CFG opens host access; a payload can keep running
  * after its target is visible. These are simulated, not firmware emulation. */
-static BOOLEAN holdCpuRunning,wprRestoreIgnore;
+static BOOLEAN holdCpuRunning,wprRestoreIgnore,tlsNeedsXve;
 static ULONG fireFailAddress;
 static ULONG geometryIgnoreAddress;
 static BOOLEAN secureFail,graphicsFail,sec2Busy,queueBusy,pmcIgnore;
@@ -53,6 +53,7 @@ static VOID fakeWrite(PULONG p,ULONG value) {
         if(*(PULONG)(active->bar+0x1fa7cc)!=0xfffff0ff||wprRestoreIgnore)return;
     }
     if(cleanupIgnore&&active->report.stage==21&&(offset==REG_WPR_LO||offset==REG_WPR_HI||offset==0x1180f8))return;
+    if(offset==0x880a8&&tlsNeedsXve&&*(PULONG)(active->bar+0x8872c)!=6)return;
     *p=value;
     if(offset==0x8403c0||offset==0x1103c0) {
         *(PULONG)(active->bar+offset-0x3c0+0x10c)=resetFail?6:0;
@@ -103,7 +104,7 @@ static PVOID fakeAlloc(PDMA_ADAPTER a,ULONG n,PPHYSICAL_ADDRESS logical,BOOLEAN 
     return allocationFail?NULL:calloc(1,n);
 }
 static VOID fakeFree(PDMA_ADAPTER a,ULONG n,PHYSICAL_ADDRESS logical,PVOID p,BOOLEAN cache) {
-    if(active->report.mode==CMP_MEMORY&&active->report.checks&CMP_CLEANUP_VERIFIED) {
+    if(active->report.mode==CMP_MEMORY&&!active->report.pcie_requested&&active->report.checks&CMP_CLEANUP_VERIFIED) {
         FILE *f=NULL;
         if(fopen_s(&f,"build/memory-dma.bin","wb")==0){fwrite(p,1,n,f);fclose(f);}
     }

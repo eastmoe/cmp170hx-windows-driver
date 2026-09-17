@@ -23,13 +23,83 @@ static VOID init(Context *c,USHORT id) {
     writes=allocations=frees=releases=0;allocationFail=fireFail=resetFail=FALSE;pciCommand=6;
     cleanupIgnore=cleanupReadFail=dmaBusy=finalSnapshotFail=FALSE;
     holdCpuRunning=TRUE;wprRestoreIgnore=FALSE;fireFailAddress=0;
-    geometryIgnoreAddress=0;
+    geometryIgnoreAddress=0;tlsNeedsXve=FALSE;
     fireCount=wprWhileRunning=geometryWrites=0;RtlZeroMemory(fired,sizeof(fired));
     c->resetInterface.DeviceReset=fakeFinalReset;c->report.reset_supported=1;
     resetResult=STATUS_SUCCESS;resetCalls=reads=0;
 }
 int main(VOID) {
     Context c;NTSTATUS s;unsigned original;
+    {
+        u8 *stock=malloc(SIG_SIZE),*gen=malloc(SIG_SIZE+16);u32 want[PCIE_COUNT];unsigned i,j;
+        CHECK(stock&&gen);
+        for(i=0;i<PCIE_COUNT;i++)want[i]=pcie_value(i,0x55555555u);
+        memset(gen,0xa5,SIG_SIZE+16);
+        fill_memory_signature(stock,0x2779000,0x20b,0x88888888,8);
+        fill_pcie_signature(gen+8,want,0x2779000,0x20b);
+        for(i=0;i<8;i++)CHECK(gen[i]==0xa5&&gen[SIG_SIZE+8+i]==0xa5);
+        for(i=0;i<SIG_SIZE;i++) {
+            BOOLEAN changed=FALSE;
+            for(j=0;j<13;j++) {
+                unsigned addr=0xe460+j*0x30;
+                unsigned val=0xe474+j*0x30;
+                if(i>=addr&&i<addr+4)changed=TRUE;
+                if(j<12&&i>=val&&i<val+4)changed=TRUE;
+            }
+            if(!changed)CHECK(stock[i]==gen[i+8]);
+        }
+        free(stock);free(gen);
+    }
+    init(&c,0x20c2);c.report.pcie_requested=1;tlsNeedsXve=TRUE;
+    *(PULONG)(c.bar+0x880a8)=1;
+    CHECK(NT_SUCCESS(run(NULL,&c,CMP_MEMORY))&&c.report.pcie_configured==1);
+    CHECK(*(PULONG)(c.bar+0x8872c)==6&&(c.report.pcie_after[16]&15)==2);free(c.bar);
+    /* Real 0.10 failure: VSEC_DEVICE ignores bit0; required writes continue. */
+    init(&c,0x20c2);c.report.pcie_requested=1;
+    *(PULONG)(c.bar+0x8860c)=0x800;geometryIgnoreAddress=0x8860c;
+    CHECK(NT_SUCCESS(run(NULL,&c,CMP_MEMORY))&&c.report.pcie_configured==1);
+    CHECK(c.report.pcie_after[12]==0x800&&c.report.pcie_wanted[12]==0x801);
+    CHECK(c.report.pcie_after[14]==c.report.pcie_wanted[14]&&(c.report.pcie_after[16]&15)==2);
+    /* Fresh driver context, retained verified hardware, no second memory RUN. */
+    c.attempted=FALSE;RtlZeroMemory(&c.report,sizeof(c.report));c.report.pcie_requested=2;
+    *(PULONG)(c.bar+0x88610)=0x1001;*(PULONG)(c.bar+0x8c2c0)|=4;
+    *(PULONG)(c.bar+0x880a8)=1;
+    original=writes;CHECK(NT_SUCCESS(run(NULL,&c,CMP_MEMORY))&&writes==original+4);
+    CHECK(fireCount==2&&allocations==1&&c.report.checks==31&&c.report.pcie_configured==1);
+    CHECK(NT_SUCCESS(memoryHandover(&c))&&c.mmioClosed&&resetCalls==0);free(c.bar);
+    init(&c,0x20c2);c.report.pcie_requested=2;
+    CHECK(!NT_SUCCESS(run(NULL,&c,CMP_MEMORY))&&writes==0&&allocations==0);free(c.bar);
+    init(&c,0x20c2);c.report.pcie_requested=1;CHECK(NT_SUCCESS(run(NULL,&c,CMP_MEMORY)));
+    c.attempted=FALSE;RtlZeroMemory(&c.report,sizeof(c.report));c.report.pcie_requested=2;
+    *(PULONG)(c.bar+0x8e110)=0;original=writes;
+    CHECK(!NT_SUCCESS(run(NULL,&c,CMP_MEMORY))&&writes==original);free(c.bar);
+    init(&c,0x20c2);c.report.pcie_requested=1;CHECK(NT_SUCCESS(run(NULL,&c,CMP_MEMORY)));
+    c.attempted=FALSE;RtlZeroMemory(&c.report,sizeof(c.report));c.report.pcie_requested=2;
+    *(PULONG)(c.bar+0x110118)=0;original=writes;
+    CHECK(!NT_SUCCESS(run(NULL,&c,CMP_MEMORY))&&writes==original);free(c.bar);
+    /* Gen2 config success is distinct from a Gen1 live link. */
+    init(&c,0x20c2);c.report.pcie_requested=1;
+    *(PULONG)(c.bar+0x88088)=0x00410000;
+    *(PULONG)(c.bar+0x8841c)=0xa5a55055;
+    CHECK(NT_SUCCESS(run(NULL,&c,CMP_MEMORY))&&fireCount==2&&geometryWrites==2);
+    CHECK(c.report.pcie_configured==1&&c.report.pcie_link_status==0x00410000);
+    CHECK(c.report.checks==31&&hostGeometry==0&&hostWpr==0&&gspResets==0);
+    CHECK(c.report.pcie_after[11]==((0xa5a55055|0x2800u)&~0x5000u));
+    for(original=0;original<writeCount;original++)CHECK(writeRegs[original]!=0x8872c&&writeRegs[original]!=0x8c1c0);
+    diagnose(&c);CHECK(c.report.diagnostic_status==0);
+    *(PULONG)(c.bar+0x8c2c0)=4;
+    CHECK(!NT_SUCCESS(memoryHandover(&c))&&!c.mmioClosed&&c.report.state==2);free(c.bar);
+    init(&c,0x20c2);c.report.pcie_requested=1;fireFailAddress=0x88fec;
+    CHECK(!NT_SUCCESS(run(NULL,&c,CMP_MEMORY))&&fireCount==2&&frees==1&&c.report.state==2);
+    CHECK(!c.report.pcie_configured&&resetCalls==0);free(c.bar);
+    init(&c,0x20c2);c.report.pcie_requested=1;*(PULONG)(c.bar+0x8841c)=0xffffffff;
+    CHECK(!NT_SUCCESS(run(NULL,&c,CMP_MEMORY))&&writes==0&&allocations==0);free(c.bar);
+    init(&c,0x20c2);c.report.pcie_requested=1;sec2Busy=TRUE;
+    CHECK(!NT_SUCCESS(run(NULL,&c,CMP_MEMORY))&&fireCount==1&&frees==0&&!c.report.pcie_configured);free(c.bar);
+    init(&c,0x20c2);c.report.pcie_requested=1;
+    CHECK(NT_SUCCESS(run(NULL,&c,CMP_MEMORY)));
+    CHECK(NT_SUCCESS(memoryHandover(&c))&&c.mmioClosed&&resetCalls==0);
+    original=reads;diagnose(&c);CHECK(reads==original);free(c.bar);
     init(&c,0x20c2);pciCommand=2;s=run(NULL,&c,CMP_COMPUTE);
     CHECK(s==STATUS_DEVICE_NOT_READY&&writes==0&&allocations==0);free(c.bar);
     init(&c,0x20c2);allocationFail=TRUE;s=run(NULL,&c,CMP_COMPUTE);
